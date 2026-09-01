@@ -103,7 +103,8 @@ nmcli connection delete wg0
   `connectionName`. Import your config (right-click) or fix `connectionName`.
 - **Toggle fails** — the connection exists but `up` failed; run
   `nmcli connection up wg0` in a terminal for the error.
-- **Config path with `~`** — the import runs through `bash -lc`, so `~` expands.
+- **Config path with `~`** — the widget expands a leading `~/` to your home
+  directory before invoking the import, so `~/.config/wireguard/wg0.conf` works.
 - **Debug logs** — `qs log -p "$OMARCHY_PATH/shell" --tail 100`.
 
 ## License

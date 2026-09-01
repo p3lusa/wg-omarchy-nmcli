@@ -39,9 +39,9 @@ BarWidget {
   function refresh() {
     if (statusProbe.running) return
     statusProbe.command = ["bash", "-lc",
-      "nmcli -t -f NAME,TYPE connection show --active | grep -qxF '" + root.connName + ":wireguard'; " +
-      "test $? -eq 0 && exit 0; " +
-      "nmcli -t -f NAME connection show | grep -qxF '" + root.connName + "'"]
+      "nmcli -t -f NAME,TYPE connection show --active | grep -qxF '" + root.connName + ":wireguard' && exit 0; " +
+      "nmcli -t -f NAME connection show | grep -qxF '" + root.connName + "' && exit 10; " +
+      "exit 20"]
     statusProbe.running = true
   }
 
@@ -74,9 +74,11 @@ BarWidget {
 
   function importConfig() {
     if (root.cfgPath === "" || root.busy || actionProc.running) return
+    var path = root.cfgPath
+    if (path.indexOf("~/") === 0) path = Qt.application.homePath() + path.slice(1)
     root.busy = true
     actionProc.command = ["bash", "-lc",
-      "nmcli connection import type wireguard file " + Util.shellQuote(root.cfgPath)]
+      "nmcli connection import type wireguard file " + Util.shellQuote(path)]
     actionProc.running = true
   }
 
