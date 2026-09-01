@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.p3lu.wg-omarchy-nmcli",
+  "name": "WireGuard VPN",
+  "version": "0.2.0",
+  "author": "P3lu",
+  "license": "MIT",
+  "description": "WireGuard VPN toggle for the Omarchy bar, driven by NetworkManager (nmcli). Import your wg0.conf into NetworkManager with one right-click.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "WireGuard",
+    "description": "Toggle a WireGuard connection up/down via nmcli; import a wg0.conf into NetworkManager.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": [
+      {
+        "key": "connectionName",
+        "type": "string",
+        "label": "NM connection name",
+        "defaultValue": "wg0"
+      },
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Poll interval (seconds)",
+        "min": 1,
+        "max": 600,
+        "step": 1,
+        "defaultValue": 4
+      },
+      {
+        "key": "configFile",
+        "type": "string",
+        "label": "WireGuard config to import (right-click)",
+        "defaultValue": ""
+      }
+    ]
+  }
+}
