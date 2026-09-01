@@ -16,9 +16,9 @@ with a right-click.
 ## Install
 
 ```sh
-omarchy plugin add https://github.com/P3lu/wg-omarchy-nmcli.git --enable
+omarchy plugin add https://github.com/p3lusa/wg-omarchy-nmcli.git --enable
 # non-interactive (no prompts):
-omarchy plugin add https://github.com/P3lu/wg-omarchy-nmcli.git --enable --yes
+omarchy plugin add https://github.com/p3lusa/wg-omarchy-nmcli.git --enable --yes
 ```
 
 ### Dependencies
