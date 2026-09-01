@@ -21,9 +21,6 @@ omarchy plugin add https://github.com/P3lu/wg-omarchy-nmcli.git --enable
 omarchy plugin add https://github.com/P3lu/wg-omarchy-nmcli.git --enable --yes
 ```
 
-> The Omarchy CLI has no `--activate` flag; `--enable` enables the plugin right after
-> cloning (without it the plugin lands disabled for code review).
-
 ### Dependencies
 
 - `networkmanager` (and a running NetworkManager — Omarchy ships it)
