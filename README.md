@@ -109,7 +109,7 @@ omarchy-shell shell call io.github.p3lu.wg-omarchy-nmcli toggle
 
 ## Architecture
 
-A single `Panel.qml` (the `bar-widget` entry point) hosts both the bar icon
+A single `Widget.qml` (the `bar-widget` entry point) hosts both the bar icon
 (`BarIconButton`) and the popup (`KeyboardPanel`), matching the first-party
 Wi-Fi plugin. Connection state, details, and DNS are pulled through `Process`
 calls (`nmcli`, `ip`, `wg`) that poll on a timer while the panel is open; the

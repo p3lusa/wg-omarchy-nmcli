@@ -7,7 +7,7 @@
   "license": "MIT",
   "description": "WireGuard VPN widget for the Omarchy bar: left-click opens a themed status panel with IP/gateway/peer/handshake details and DNS control; connect/disconnect via nmcli.",
   "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "Panel.qml" },
+  "entryPoints": { "barWidget": "Widget.qml" },
   "barWidget": {
     "displayName": "WireGuard",
     "description": "A themed WireGuard panel (state, IP, gateway, DNS) plus one-click connect/disconnect via nmcli.",
