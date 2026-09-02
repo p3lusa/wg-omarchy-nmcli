@@ -265,15 +265,19 @@ Panel {
   IpcHandler {
     target: "io.github.p3lu.wg-omarchy-nmcli"
 
-    function open() { root.open() }
-    function close() { root.close() }
-    function show() { root.open() }
-    function hide() { root.close() }
-    function toggle() { root.toggle() }
-    function status() {
+    // Every IPC handler function needs EXPLICIT argument and return types,
+    // or Quickshell does not register it (WARN scene: "Type of argument 1
+    // (...) cannot be used across IPC"). Allowed: string, int, bool, real,
+    // color, void — matches the 0.2.0 handler and the first-party panels.
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function status(): string {
       return JSON.stringify({ on: root.on, connection: root.connName, known: root.connKnown, dns: root.dnsProvider })
     }
-    function setStatus(target) {
+    function setStatus(target: string): void {
       var up = target === "up" || target === "on" || target === "true"
       if (up === root.on) return
       root.busy = true
@@ -281,9 +285,9 @@ Panel {
       actionProc.command = ["nmcli", "connection", up ? "up" : "down", root.connName]
       actionProc.running = true
     }
-    function importConfig() { root.importConfig() }
-    function setDns(provider) { root.setDns(provider) }
-    function refreshStatus() { root.probeStatus() }
+    function importConfig(): void { root.importConfig() }
+    function setDns(provider: string): void { root.setDns(provider) }
+    function refreshStatus(): void { root.probeStatus() }
   }
 
   // ---- processes --------------------------------------------------------------------
