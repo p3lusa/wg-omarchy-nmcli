@@ -334,9 +334,9 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // Connected = md-key U+F0306. Disconnected candidate pending user choice
-    // (current md-bookmark U+F00C0 reads as a label, not a state).
-    text: root.on ? "\u{F0306}" : "\u{F00C0}"
+    // Connected = md-lock U+F033E (closed padlock). Disconnected =
+    // md-lock_open U+F033F (open padlock) — the pair the user chose 09/2026.
+    text: root.on ? "\u{F033E}" : "\u{F033F}"
     active: root.on
     dimmed: !root.connKnown
     tooltipText: !root.connKnown
@@ -430,7 +430,7 @@ Panel {
               }
 
               Text {
-                text: root.on ? "\u{F0306}" : "\u{F00C0}"
+                text: root.on ? "\u{F033E}" : "\u{F033F}"
                 color: root.connKnown
                   ? (root.on ? root.foreground : root.dim)
                   : root.urgent
