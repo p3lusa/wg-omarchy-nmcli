@@ -71,6 +71,16 @@ Panel {
                            endpoint: "", handshake: "", dns: "",
                            ping: "", loss: "", tx: "", rx: "" })
   property string actionLabel: ""   // transient "Applying…" style feedback
+  // Resolved config path as a *reactive* property. QML bindings that call a
+  // function (e.g. `resolveConfigPath()`) capture the result at init and never
+  // re-evaluate when the inputs change, so a button whose label depends on the
+  // config path would render stuck/empty. We recompute this property every time
+  // the inputs can change (panel open, after any action, each status poll).
+  property string cfgPathResolved: ""
+
+  function refreshCfgPath() {
+    root.cfgPathResolved = root.resolveConfigPath()
+  }
 
   // ---- keyboard cursor ----------------------------------------------------
   // One cursor across the action rows (connect/disconnect, import).
@@ -99,6 +109,7 @@ Panel {
 
   // ---- data ----------------------------------------------------------------
   function refresh() {
+    refreshCfgPath()
     probeStatus()
     refreshDetails()
   }
@@ -543,11 +554,18 @@ Panel {
         Button {
           id: importBtn
           width: parent.width
+          // `cfgPathResolved` is a reactive property (refreshed in refresh()),
+          // not a function call, so this binding re-evaluates when the resolved
+          // path changes. A function call in a QML binding captures the value
+          // once at init and would leave the label stuck/empty.
           text: root.busy && root.actionLabel === "Importing…"
             ? root.actionLabel
-            : (root.resolveConfigPath() !== ""
-                ? "Import config (" + root.resolveConfigPath() + ")"
-                : "Import config to NetworkManager — no .conf found")
+            : (root.cfgPathResolved !== ""
+                ? "Import config to NetworkManager"
+                : "Import config — no .conf found")
+          tooltipText: root.cfgPathResolved !== ""
+            ? root.cfgPathResolved
+            : "No config found. Set configFile, or place " + root.connName + ".conf in ~/.config/wireguard/ or /etc/wireguard/."
           fontSize: Style.font.bodySmall
           foreground: root.busy ? root.dim : root.dim
           fontFamily: root.fontFamily
@@ -555,8 +573,8 @@ Panel {
           verticalPadding: Style.spacing.controlPaddingY
           bordered: true
           active: root.cursorActive && root.actionsIndex === 1
-          opacity: (root.busy || root.resolveConfigPath() === "") ? 0.5 : 1
-          onClicked: { if (root.busy || root.resolveConfigPath() === "") return; root.importConfig() }
+          opacity: (root.busy || root.cfgPathResolved === "") ? 0.5 : 1
+          onClicked: { if (root.busy || root.cfgPathResolved === "") return; root.importConfig() }
           onHovered: function(isHovered) {
             if (!isHovered) return
             root.cursorActive = true
