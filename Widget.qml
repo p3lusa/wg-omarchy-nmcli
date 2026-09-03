@@ -10,7 +10,10 @@ import qs.Ui
 // this Panel is BOTH the bar icon (BarIconButton) and the left-click popup
 // (KeyboardPanel). The base Panel class owns bar/settings/ipcTarget/controller/
 // opened/open()/close()/toggle()/setting(); we add the WireGuard state, the
-// detail probe, DNS control, and the themed status card (design style B).
+// live detail probe (ip/gateway/peer/handshake/ping/loss/throughput), the
+// themed status card (design style B), and the connect/disconnect + import
+// actions. DNS is intentionally NOT managed here: the WireGuard config's own
+// DNS is the only leak-free source, so the panel only shows it (read-only).
 Panel {
   id: root
   moduleName: "io.github.p3lu.wg-omarchy-nmcli"
@@ -22,6 +25,30 @@ Panel {
   // ---- settings -----------------------------------------------------------
   readonly property string connName: setting("connectionName", "wg0")
   readonly property string cfgPath: String(setting("configFile", "") || "").trim()
+
+  // Config discovery for the import action: explicit setting first, then the
+  // conventional per-connection locations. The button is always visible; if
+  // nothing resolves it reports so and the import is disabled.
+  readonly property var cfgCandidates: [
+    cfgPath,
+    "~/.config/wireguard/" + connName + ".conf",
+    "/etc/wireguard/" + connName + ".conf"
+  ]
+
+  function resolveConfigPath() {
+    for (var i = 0; i < root.cfgCandidates.length; i++) {
+      var p = String(root.cfgCandidates[i] || "").trim()
+      if (p === "") continue
+      if (p.indexOf("~/") === 0) p = Qt.application.homePath() + p.slice(1)
+      if (root.fileExists(p)) return p
+    }
+    return ""
+  }
+
+  function fileExists(path) {
+    if (!Qt.fileExists) return false
+    return Qt.fileExists(path)
+  }
 
   // ---- theme --------------------------------------------------------------
   // Every color derives from the bar / theme (same sources the first-party
@@ -38,29 +65,18 @@ Panel {
   property bool on: false
   property bool connKnown: true
   property bool busy: false
-  // { iface, ip, prefix, gateway, peer, handshake, dns }
-  property var details: ({ iface: "", ip: "", prefix: "", gateway: "", peer: "", handshake: "", dns: "" })
-  property string dnsProvider: ""
-  property string pendingDns: ""
-  property string customDns: ""
-  property bool customOpen: false
+  // { iface, ip, prefix, gateway, peer, endpoint, handshake, dns,
+  //    ping, loss, tx, rx } — ping/loss/tx/rx only while the tunnel is up.
+  property var details: ({ iface: "", ip: "", prefix: "", gateway: "", peer: "",
+                           endpoint: "", handshake: "", dns: "",
+                           ping: "", loss: "", tx: "", rx: "" })
   property string actionLabel: ""   // transient "Applying…" style feedback
 
-  readonly property var dnsProviders: ["DHCP", "Cloudflare", "Google"]
-  readonly property var knownDns: ({
-    DHCP: "from DHCP",
-    Cloudflare: "1.1.1.1, 1.0.0.1",
-    Google: "8.8.8.8, 8.8.4.4"
-  })
-
   // ---- keyboard cursor ----------------------------------------------------
-  // One cursor across the whole panel, like the network panel: sections
-  // "dns" (pills) → "custom" (inline editor) → "actions" (toggle, import).
-  property string focusSection: "dns"
-  property int dnsIndex: 0
+  // One cursor across the action rows (connect/disconnect, import).
   property int actionsIndex: 0
   property bool cursorActive: false
-  readonly property int actionsCount: cfgPath !== "" ? 2 : 1
+  readonly property int actionsCount: 2
   readonly property string statusText: !connKnown
     ? "No connection found"
     : (on ? "TUNNEL ACTIVE" : "NOT CONNECTED")
@@ -68,20 +84,14 @@ Panel {
 
   // ---- lifecycle ----------------------------------------------------------
   // Mirrors the first-party network panel: the base Panel's open()/toggle()
-  // drive the popup; onOpenedChanged does the work. close() also drops the
-  // inline DNS editor so a reopened panel always starts clean.
+  // drive the popup; onOpenedChanged does the work.
   function close() {
-    closeCustom()
     controller.hide()
   }
 
   onOpenedChanged: {
     if (opened) {
-      customOpen = false
-      customDns = ""
       cursorActive = false
-      focusSection = "dns"
-      dnsIndex = 0
       actionsIndex = 0
       refresh()
     }
@@ -91,7 +101,6 @@ Panel {
   function refresh() {
     probeStatus()
     refreshDetails()
-    refreshDns()
   }
 
   function probeStatus() {
@@ -111,35 +120,81 @@ Panel {
     detailsProc.running = true
   }
 
-  function refreshDns() {
-    if (dnsProc.running) return
-    dnsProc.command = ["bash", "-lc",
-      "command -v omarchy-dns >/dev/null 2>&1 && omarchy-dns 2>/dev/null | head -1 || echo DHCP"]
-    dnsProc.running = true
-  }
-
   function detailsScript() {
-    // The connection name arrives as $1 (argv, not embedded) so names with
-    // spaces or shell metacharacters survive. awk is used only for simple
-    // field extraction (the dev VM's gawk rejects multi-char class syntax).
+    // Connection name arrives as $1 (argv, not embedded) so names with spaces
+    // or shell metacharacters survive. awk is used only for simple field
+    // extraction (the dev VM's gawk rejects multi-char class syntax); the
+    // fiddly text surgery is sed/tr/xargs.
+    //
+    // Live metrics:
+    //  - ping/loss: one 2-packet ping at the peer endpoint (2s cap)
+    //  - tx/rx: delta of /sys/class/net/$1/statistics over the previous poll
+    //    (previous sample kept in /tmp), so the 1.5s panel poll yields rates
+    //  - handshake: `wg show` needs root; try `sudo -n` and degrade silently
+    //    to empty when sudoers is not configured for the user.
+    //  - gateway: default route on the iface; when absent (host-route setups)
+    //    fall back to the WG endpoint, which is where the traffic actually goes.
     return "c=\"$1\";" +
       "ip=$(ip -4 -o addr show dev \"$c\" 2>/dev/null | awk '{print $4}' | head -n1);" +
       "gw=$(ip route show dev \"$c\" 2>/dev/null | awk '/default/ {print $3; exit}');" +
-      "peer=$(wg show \"$c\" 2>/dev/null | awk '/public key/ {print $3; exit}');" +
-      "hs=$(wg show \"$c\" 2>/dev/null | awk '/last handshake/ {print $3, $4, $5; exit}');" +
+      "peer=$(wg show \"$c\" 2>/dev/null | awk '/^peer:/ {print $2; exit}');" +
+      "hs=$(wg show \"$c\" 2>/dev/null | awk '/handshake/ {print $3, $4, $5; exit}');" +
+      "if [ -z \"$hs\" ]; then hs=$(sudo -n wg show \"$c\" 2>/dev/null | awk '/handshake/ {print $3, $4, $5; exit}'); fi;" +
       "dns=$(nmcli -t -f IPV4.DNS,IPV6.DNS dev show \"$c\" 2>/dev/null | sed -e 's/^IPV4\\.DNS://' -e 's/^IPV6\\.DNS://' | tr ':,' ' ' | xargs);" +
+      "ep=$(grep -s '^Endpoint=' ~/.config/wireguard/\"$c\".conf /etc/wireguard/\"$c\".conf 2>/dev/null | head -n1 | cut -d= -f2-);" +
+      "case \"$ep\" in" +
+      "  \\[*\\]*) ep=${ep#\\[}; ep=${ep%%\\]*} ;;" +
+      "  *:*) ep=${ep%%:*} ;;" +
+      "esac;" +
+      "ping=\"\"; loss=\"\";" +
+      "if [ -n \"$ep\" ]; then" +
+      "  pout=$(ping -c 2 -W 2 -q \"$ep\" 2>/dev/null);" +
+      "  loss=$(printf '%s\\n' \"$pout\" | sed -n 's/.* \\([0-9.]*\\)% packet loss.*/\\1/p');" +
+      "  ping=$(printf '%s\\n' \"$pout\" | sed -n 's/.* = \\([^ ]*\\) ms.*/\\1/p' | awk -F'/' '{print $2}');" +
+      "fi;" +
+      "tx=\"\"; rx=\"\";" +
+      "if [ -f /sys/class/net/\"$c\"/statistics/tx_bytes ]; then" +
+      "  t=$(cat /sys/class/net/\"$c\"/statistics/tx_bytes 2>/dev/null);" +
+      "  r=$(cat /sys/class/net/\"$c\"/statistics/rx_bytes 2>/dev/null);" +
+      "  n=$(date +%s);" +
+      "  f=\"/tmp/wg-omarchy-nmcli-rate.\"$c;" +
+      "  if [ -f \"$f\" ]; then" +
+      "    read pt pr pn < \"$f\" 2>/dev/null;" +
+      "    if [ -n \"$pn\" ] && [ \"$n\" -gt \"$pn\" ]; then" +
+      "      tx=$(( (t - pt) / (n - pn) ));" +
+      "      rx=$(( (r - pr) / (n - pn) ));" +
+      "      if [ \"$tx\" -lt 0 ]; then tx=0; fi;" +
+      "      if [ \"$rx\" -lt 0 ]; then rx=0; fi;" +
+      "    fi;" +
+      "  fi;" +
+      "  printf '%s %s %s' \"$t\" \"$r\" \"$n\" > \"$f\" 2>/dev/null;" +
+      "fi;" +
       "printf 'iface\\t%s\\n' \"$c\";" +
       "printf 'ip\\t%s\\n' \"${ip:-}\";" +
-      "printf 'gateway\\t%s\\n' \"${gw:-}\";" +
+      "printf 'gateway\\t%s\\n' \"${gw:-${ep:-}}\";" +
       "printf 'peer\\t%s\\n' \"${peer:-}\";" +
+      "printf 'endpoint\\t%s\\n' \"${ep:-}\";" +
       "printf 'handshake\\t%s\\n' \"${hs:-}\";" +
-      "printf 'dns\\t%s\\n' \"${dns:-}\""
+      "printf 'dns\\t%s\\n' \"${dns:-}\";" +
+      "printf 'ping\\t%s\\n' \"${ping:-}\";" +
+      "printf 'loss\\t%s\\n' \"${loss:-}\";" +
+      "printf 'tx\\t%s\\n' \"${tx:-}\";" +
+      "printf 'rx\\t%s\\n' \"${rx:-}\""
+  }
+
+  function humanRate(bytesPerSec) {
+    var v = Number(bytesPerSec || 0)
+    if (v <= 0) return ""
+    if (v >= 1024 * 1024) return (Math.round(v / 102.4) / 10) + " MiB/s"
+    return Math.round(v / 1024) + " KiB/s"
   }
 
   function updateDetails(text) {
     var parts = ({ iface: root.details.iface, ip: root.details.ip, prefix: root.details.prefix,
                    gateway: root.details.gateway, peer: root.details.peer,
-                   handshake: root.details.handshake, dns: root.details.dns })
+                   endpoint: root.details.endpoint, handshake: root.details.handshake,
+                   dns: root.details.dns, ping: root.details.ping, loss: root.details.loss,
+                   tx: root.details.tx, rx: root.details.rx })
     var lines = String(text || "").split("\n")
     for (var i = 0; i < lines.length; i++) {
       var tab = lines[i].indexOf("\t")
@@ -167,98 +222,28 @@ Panel {
   }
 
   function importConfig() {
-    if (root.cfgPath === "" || root.busy) return
-    var path = root.cfgPath
-    if (path.indexOf("~/") === 0) path = Qt.application.homePath() + path.slice(1)
+    var path = root.resolveConfigPath()
+    if (path === "" || root.busy) return
     root.busy = true
     root.actionLabel = "Importing…"
     actionProc.command = ["bash", "-lc",
-      "nmcli connection import type wireguard file " + Util.shellQuote(path)]
-    actionProc.running = true
-  }
-
-  function setDns(provider) {
-    if (!provider || root.busy) return
-    if (provider === "Custom") {
-      openCustom()
-      return
-    }
-    root.pendingDns = provider
-    root.busy = true
-    root.actionLabel = "Setting " + provider + "…"
-    actionProc.command = ["bash", "-lc",
-      "command -v omarchy-dns >/dev/null 2>&1 && omarchy-dns " + provider +
-      " || { nmcli connection modify " + root.connName +
-      " ipv4.dns '" + root.dnsServersFor(provider) + "'" +
-      " && nmcli -t -f NAME connection show --active | grep -qxF '" + root.connName + ":wireguard'" +
-      " && nmcli connection up " + root.connName + "; }"]
-    actionProc.running = true
-  }
-
-  function dnsServersFor(provider) {
-    if (provider === "Cloudflare") return "1.1.1.1,1.0.0.1"
-    if (provider === "Google") return "8.8.8.8,8.8.4.4"
-    return ""   // DHCP: empty clears the override
-  }
-
-  function openCustom() {
-    customOpen = true
-    focusSection = "custom"
-    cursorActive = true
-    if (root.details.dns !== "") customDns = root.details.dns
-    Qt.callLater(function() { customField.forceActiveFocus() })
-  }
-
-  function closeCustom() {
-    customOpen = false
-    customDns = ""
-    if (focusSection === "custom") focusSection = "dns"
-  }
-
-  function applyCustomDns() {
-    var raw = String(root.customDns || "").replace(/,/g, " ").trim()
-    if (raw === "" || root.busy) return
-    var v4 = [], v6 = []
-    var parts = raw.split(/\s+/)
-    for (var i = 0; i < parts.length; i++) {
-      if (parts[i].indexOf(":") >= 0) v6.push(parts[i])
-      else v4.push(parts[i])
-    }
-    root.pendingDns = "Custom"
-    root.busy = true
-    root.actionLabel = "Applying DNS…"
-    actionProc.command = ["bash", "-lc",
-      "nmcli connection modify " + root.connName +
-      " ipv4.dns '" + v4.join(",") + "'" +
-      (v6.length ? " ipv6.dns '" + v6.join(",") + "'" : " ipv6.dns ''") +
-      " && { nmcli -t -f NAME connection show --active | grep -qxF '" + root.connName + ":wireguard' && nmcli connection up " + root.connName + "; }"]
+      "{ nmcli connection import type wireguard file " + Util.shellQuote(path) +
+      " 2>/dev/null || { nmcli connection delete " + root.connName +
+      " 2>/dev/null; nmcli connection import type wireguard file " + Util.shellQuote(path) + "; }; }"]
     actionProc.running = true
   }
 
   // ---- keyboard nav ---------------------------------------------------------------
-  function selectDnsByDelta(delta) {
-    root.dnsIndex = Math.max(0, Math.min(root.dnsProviders.length - 1, root.dnsIndex + delta))
-  }
-
   function moveFocus(dy) {
-    if (dy > 0) {
-      if (root.focusSection === "dns") root.focusSection = root.customOpen ? "custom" : "actions"
-      else if (root.focusSection === "custom") root.focusSection = "actions"
-    } else {
-      if (root.focusSection === "actions") root.focusSection = root.customOpen ? "custom" : "dns"
-      else if (root.focusSection === "custom") root.focusSection = "dns"
-    }
-    if (root.focusSection === "actions" && root.cfgPath === "") root.actionsIndex = 0
+    // Two rows: clamp the index; direction only matters for the first press.
+    if (dy > 0 && root.actionsIndex === 0) root.actionsIndex = 1
+    else if (dy < 0 && root.actionsIndex === 1) root.actionsIndex = 0
   }
 
   function activateCursor() {
     if (!root.cursorActive) return
-    if (root.focusSection === "dns") root.setDns(root.dnsProviders[root.dnsIndex])
-    else if (root.focusSection === "custom") root.applyCustomDns()
-    else if (root.focusSection === "actions") {
-      if (root.actionsIndex === 0) root.toggleTunnel()
-      else if (root.cfgPath !== "" && root.actionsIndex === 1) root.importConfig()
-    }
+    if (root.actionsIndex === 0) root.toggleTunnel()
+    else if (root.actionsIndex === 1) root.importConfig()
   }
 
   // ---- IPC ------------------------------------------------------------------------
@@ -275,7 +260,9 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function status(): string {
-      return JSON.stringify({ on: root.on, connection: root.connName, known: root.connKnown, dns: root.dnsProvider })
+      return JSON.stringify({ on: root.on, connection: root.connName, known: root.connKnown,
+                              ip: root.details.ip, ping: root.details.ping,
+                              loss: root.details.loss, tx: root.details.tx, rx: root.details.rx })
     }
     function setStatus(target: string): void {
       var up = target === "up" || target === "on" || target === "true"
@@ -286,8 +273,7 @@ Panel {
       actionProc.running = true
     }
     function importConfig(): void { root.importConfig() }
-    function setDns(provider: string): void { root.setDns(provider) }
-    function refreshStatus(): void { root.probeStatus() }
+    function refreshStatus(): void { root.refresh() }
   }
 
   // ---- processes --------------------------------------------------------------------
@@ -308,23 +294,10 @@ Panel {
   }
 
   Process {
-    id: dnsProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.dnsProvider = String(text || "").trim() || "DHCP"
-    }
-  }
-
-  Process {
     id: actionProc
     onExited: function(code) {
-      if (root.pendingDns !== "") {
-        if (code === 0) root.dnsProvider = root.pendingDns
-        root.pendingDns = ""
-      }
       root.busy = false
       root.actionLabel = ""
-      root.closeCustom()
       Qt.callLater(root.refresh)
     }
   }
@@ -339,14 +312,16 @@ Panel {
     onTriggered: root.probeStatus()
   }
 
-  // Faster detail / DNS polling while the panel is open so the card catches
-  // up as soon as NetworkManager finishes activating a connection.
+  // Faster detail polling while the panel is open so the card catches up as
+  // soon as NetworkManager finishes activating the connection. The rate
+  // script keeps its previous sample in /tmp, so consecutive polls yield the
+  // tx/rx throughput.
   Timer {
     id: detailsPoll
     interval: 1500
     repeat: true
-    running: root.opened
-    onTriggered: { root.refreshDetails(); root.refreshDns() }
+    running: root.opened && root.on
+    onTriggered: root.refreshDetails()
   }
 
   Component.onCompleted: root.refresh()
@@ -359,8 +334,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // Connected = wifi glyph U+F0306 (unchanged per decision);
-    // Disconnected = shield U+F00C0 (user's choice from the proposals).
+    // Connected = md-key U+F0306. Disconnected candidate pending user choice
+    // (current md-bookmark U+F00C0 reads as a label, not a state).
     text: root.on ? "\u{F0306}" : "\u{F00C0}"
     active: root.on
     dimmed: !root.connKnown
@@ -389,19 +364,13 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      // Freeze the cursor model while the inline DNS editor is open; the
-      // TextField owns input until Esc/Enter/Cancel.
-      blocked: root.customOpen && root.focusSection === "custom"
-
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) {
           root.cursorActive = true
-          root.focusSection = "dns"
-          root.dnsIndex = 0
+          root.actionsIndex = 0
           if (dy !== 0) return
         }
         if (dy !== 0) root.moveFocus(dy)
-        else if (dx !== 0 && root.focusSection === "dns") root.selectDnsByDelta(dx)
       }
       onActivateRequested: root.activateCursor()
       onCloseRequested: root.close()
@@ -439,7 +408,7 @@ Panel {
           anchors.rightMargin: Style.spacing.md
           spacing: Style.spacing.md
 
-          // Rail: status dot + shield
+          // Rail: status dot + glyph
           Rectangle {
             id: rail
             width: Style.space(46)
@@ -461,7 +430,7 @@ Panel {
               }
 
               Text {
-                text: root.on ? "\u{F0306}" : "\u{F00C0}"   // wifi / shield (Nerd Font)
+                text: root.on ? "\u{F0306}" : "\u{F00C0}"
                 color: root.connKnown
                   ? (root.on ? root.foreground : root.dim)
                   : root.urgent
@@ -499,7 +468,8 @@ Panel {
             }
 
             // Detail grid — mounted always so late samples never reflow the
-            // card; cells read "--" until the first probe lands.
+            // card; cells read "--" until the first probe lands. Metrics rows
+            // only make sense with the tunnel up.
             GridLayout {
               id: dataGrid
               width: parent.width
@@ -508,162 +478,29 @@ Panel {
               rowSpacing: Style.space(8)
               visible: root.on
 
-              DCell {
-                label: "IP"
-                value: root.details.ip !== ""
-                  ? root.details.ip + (root.details.prefix !== "" ? "/" + root.details.prefix : "")
-                  : ""
-              }
-              DCell {
-                label: "Gateway"
-                value: root.details.gateway
-              }
-              DCell {
-                label: "Peer"
-                value: root.details.peer
-              }
-              DCell {
-                label: "Last handshake"
-                value: root.details.handshake !== "" ? root.details.handshake + " ago" : ""
-              }
+              DCell { label: "IP"; value: root.details.ip !== ""
+                ? root.details.ip + (root.details.prefix !== "" ? "/" + root.details.prefix : "") : "" }
+              DCell { label: "Gateway"; value: root.details.gateway }
+              DCell { label: "Peer key"; value: root.details.peer }
+              DCell { label: "Last handshake"; value: root.details.handshake }
+              DCell { label: "Ping"; value: root.details.ping !== "" ? root.details.ping + " ms" : "" }
+              DCell { label: "Loss"; value: root.details.loss !== "" ? root.details.loss + " %" : "" }
+              DCell { label: "Download"; value: root.humanRate(root.details.rx) }
+              DCell { label: "Upload"; value: root.humanRate(root.details.tx) }
             }
-          }
-        }
-      }
 
-      // ---- DNS ----
-      PanelSeparator {
-        foreground: root.foreground
-      }
-
-      Column {
-        width: parent.width
-        spacing: Style.space(10)
-
-        PanelSectionHeader {
-          text: "DNS"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-        }
-
-        Row {
-          id: dnsRow
-          width: parent.width
-          spacing: Style.space(6)
-          readonly property real cellWidth: (width - spacing * 4) / 4
-
-          DnsPill { provider: "DHCP"; slot: 0 }
-          DnsPill { provider: "Cloudflare"; slot: 1 }
-          DnsPill { provider: "Google"; slot: 2 }
-          DnsPill {
-            provider: "Custom"
-            slot: 3
-            active: root.dnsProvider === "Custom" || root.customOpen
-            onClicked: { if (root.busy) return; root.openCustom() }
-            onHovered: function(isHovered) {
-              if (!isHovered) return
-              root.cursorActive = true
-              root.focusSection = "dns"
-              root.dnsIndex = 3
-            }
-          }
-        }
-
-        // Live servers currently in effect.
-        Text {
-          textFormat: Text.PlainText
-          width: parent.width
-          visible: root.details.dns === ""
-          height: visible ? implicitHeight : 0
-          text: "DNS: " + (root.dnsProvider !== "" ? (root.knownDns[root.dnsProvider] || root.dnsProvider) : "—")
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          elide: Text.ElideRight
-        }
-
-        Text {
-          textFormat: Text.PlainText
-          width: parent.width
-          visible: root.details.dns !== ""
-          height: visible ? implicitHeight : 0
-          text: "now: " + root.details.dns
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          elide: Text.ElideRight
-        }
-
-        // Inline custom-DNS editor.
-        Item {
-          width: parent.width
-          visible: root.customOpen
-          height: visible ? implicitHeight : 0
-          implicitHeight: customField.implicitHeight + Style.space(4) + customApplyRow.implicitHeight
-
-          TextField {
-            id: customField
-            width: parent.width
-            text: root.customDns
-            placeholderText: "1.1.1.1, 1.0.0.1"
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            foreground: root.foreground
-            horizontalPadding: Style.spacing.controlGap
-            verticalPadding: Style.spacing.controlPaddingY
-            enabled: !root.busy
-
-            onAccepted: root.applyCustomDns()
-            onTextChanged: if (root.customOpen && text !== root.customDns) root.customDns = text
-            Keys.onEscapePressed: {
-              root.closeCustom()
-              Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-            }
-            onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
-          }
-
-          Row {
-            id: customApplyRow
-            width: parent.width
-            anchors.top: customField.bottom
-            anchors.topMargin: Style.space(4)
-            spacing: Style.space(6)
-
+            // The WireGuard config's own DNS, read-only: it is the only
+            // leak-free source, so this panel shows it but never changes it.
             Text {
-              text: root.busy && root.focusSection === "custom" ? "Applying…" : ""
+              textFormat: Text.PlainText
+              width: parent.width
+              visible: root.on && root.details.dns !== ""
+              height: visible ? implicitHeight : 0
+              text: "DNS: " + root.details.dns
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              anchors.verticalCenter: parent.verticalCenter
-            }
-
-            Button {
-              text: "Apply"
-              fontSize: Style.font.bodySmall
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              bordered: true
-              active: root.cursorActive && root.focusSection === "custom"
-              opacity: root.busy ? 0.5 : 1
-              anchors.verticalCenter: parent.verticalCenter
-              onClicked: root.applyCustomDns()
-            }
-
-            Button {
-              text: "Cancel"
-              fontSize: Style.font.bodySmall
-              foreground: root.dim
-              fontFamily: root.fontFamily
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              bordered: true
-              anchors.verticalCenter: parent.verticalCenter
-              onClicked: {
-                root.closeCustom()
-                Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-              }
+              elide: Text.ElideRight
             }
           }
         }
@@ -690,7 +527,7 @@ Panel {
           horizontalPadding: Style.spacing.controlPaddingX
           verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
           bordered: true
-          active: root.cursorActive && root.focusSection === "actions" && root.actionsIndex === 0
+          active: root.cursorActive && root.actionsIndex === 0
           opacity: (root.busy || !root.connKnown) ? 0.5 : 1
           onClicked: {
             if (root.busy || !root.connKnown) return
@@ -699,7 +536,6 @@ Panel {
           onHovered: function(isHovered) {
             if (!isHovered) return
             root.cursorActive = true
-            root.focusSection = "actions"
             root.actionsIndex = 0
           }
         }
@@ -707,22 +543,23 @@ Panel {
         Button {
           id: importBtn
           width: parent.width
-          visible: root.cfgPath !== ""
-          height: visible ? implicitHeight : 0
-          text: "Import config (" + root.cfgPath + ")"
+          text: root.busy && root.actionLabel === "Importing…"
+            ? root.actionLabel
+            : (root.resolveConfigPath() !== ""
+                ? "Import config (" + root.resolveConfigPath() + ")"
+                : "Import config to NetworkManager — no .conf found")
           fontSize: Style.font.bodySmall
           foreground: root.busy ? root.dim : root.dim
           fontFamily: root.fontFamily
           horizontalPadding: Style.spacing.controlPaddingX
           verticalPadding: Style.spacing.controlPaddingY
           bordered: true
-          active: root.cursorActive && root.focusSection === "actions" && root.actionsIndex === 1
-          opacity: root.busy ? 0.5 : 1
-          onClicked: { if (root.busy) return; root.importConfig() }
+          active: root.cursorActive && root.actionsIndex === 1
+          opacity: (root.busy || root.resolveConfigPath() === "") ? 0.5 : 1
+          onClicked: { if (root.busy || root.resolveConfigPath() === "") return; root.importConfig() }
           onHovered: function(isHovered) {
             if (!isHovered) return
             root.cursorActive = true
-            root.focusSection = "actions"
             root.actionsIndex = 1
           }
         }
@@ -755,29 +592,6 @@ Panel {
       font.pixelSize: Style.font.bodySmall
       elide: Text.ElideRight
       width: parent.width
-    }
-  }
-
-  component DnsPill: Button {
-    required property string provider
-    required property int slot
-    width: dnsRow.cellWidth
-    text: provider
-    fontSize: Style.font.bodySmall
-    foreground: root.foreground
-    fontFamily: root.fontFamily
-    horizontalPadding: Style.spacing.controlPaddingX
-    verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-    bordered: true
-    active: root.dnsProvider === provider
-    hasCursor: root.cursorActive && root.focusSection === "dns" && root.dnsIndex === slot
-    opacity: root.busy ? 0.5 : 1
-    onClicked: { if (root.busy) return; root.setDns(provider) }
-    onHovered: function(isHovered) {
-      if (!isHovered) return
-      root.cursorActive = true
-      root.focusSection = "dns"
-      root.dnsIndex = slot
     }
   }
 }
