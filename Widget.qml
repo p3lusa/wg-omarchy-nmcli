@@ -100,25 +100,36 @@ Panel {
     var pk = viaRoot ? "pkexec" : ""
     root.busy = true
     root._lastAction = "import"
+    root.importError = ""
     root.actionLabel = viaRoot && src.indexOf("/etc/") === 0 ? "Authorizing…" : "Importing…"
     // The whole plan runs as one bash invocation. $1=conn name, $2=source
     // .conf, $3=pkexec-or-empty. Staged into a 0700 mktemp dir (nmcli requires
     // the file to be named "<iface>.conf") and removed on exit via trap, so the
-    // WireGuard private key never lingers. pkexec exit codes are preserved
-    // (126 = dialog cancelled, 127 = not authorized); any other non-zero copy
-    // = 101 (source missing). nmcli import does NOT reject a name collision —
-    // it silently adds a second connection with the same name — so importing
-    // replaces: any existing profile with the same name (the very one the user
-    // asked to load) is deleted first. No other profile is ever touched.
+    // WireGuard private key never lingers.
+    //
+    // The copy is `cat > staged`, NOT `cp`: a pkexec'd cp would create the
+    // staged file as root:root (mode inherited from the 0600 source), and the
+    // user-owned chmod/nmcli could then neither fix nor read it. The
+    // redirection is performed by this user's shell, so the file belongs to
+    // the user and nmcli can read it.
+    //
+    // pkexec exit codes are preserved (126 = dialog cancelled, 127 = not
+    // authorized); any other non-zero copy = 101 (source missing). nmcli
+    // import does NOT reject a name collision — it silently adds a second
+    // connection with the same name — so importing replaces: any existing
+    // profile with the same name (the very one the user asked to load) is
+    // deleted first. No other profile is ever touched. On import failure the
+    // nmcli error is echoed to stdout (the script's only stdout) for display.
     actionProc.command = ["bash", "-lc",
       "c=\"$1\"; src=\"$2\"; pk=\"$3\"; " +
       "d=$(mktemp -d) || exit 103; trap 'rm -rf \"$d\"' EXIT; " +
-      "if [ -n \"$pk\" ]; then $pk cp -- \"$src\" \"$d/$c.conf\" 2>/dev/null; rc=$?; " +
-      "else cp -- \"$src\" \"$d/$c.conf\" 2>/dev/null; rc=$?; fi; " +
+      "if [ -n \"$pk\" ]; then $pk cat -- \"$src\" > \"$d/$c.conf\" 2>/dev/null; rc=$?; " +
+      "else cat -- \"$src\" > \"$d/$c.conf\" 2>/dev/null; rc=$?; fi; " +
       "if [ $rc -ne 0 ]; then case $rc in 126) exit 126;; 127) exit 127;; *) exit 101;; esac; fi; " +
       "chmod 600 \"$d/$c.conf\"; " +
       "nmcli -t -f NAME c show 2>/dev/null | grep -qxF \"$c\" && nmcli connection delete \"$c\" 2>/dev/null; " +
-      "nmcli connection import type wireguard file \"$d/$c.conf\" 2>/dev/null || exit 103; " +
+      "err=$(nmcli connection import type wireguard file \"$d/$c.conf\" 2>&1); rc=$?; " +
+      "if [ $rc -ne 0 ]; then printf '%s\\n' \"$err\" | head -n 1; exit 103; fi; " +
       "exit 0",
       "--", root.connName, src, pk]
     actionProc.running = true
@@ -132,11 +143,14 @@ Panel {
         root.actionLabel = ""
         root._lastAction = "toggle"
       } else {
-        root.actionLabel = code === 126
+        var msg = code === 126
           ? "Authorization cancelled"
           : (code === 127 ? "Authentication failed"
              : (code === 101 ? "No .conf found in /etc/wireguard"
-                : "Import failed"))
+                : (code === 103 && root.importError !== ""
+                    ? "Import failed: " + root.importError
+                    : "Import failed")))
+        root.actionLabel = msg
         actionLabelTimer.restart()
       }
     } else {
@@ -150,6 +164,7 @@ Panel {
                            endpoint: "", handshake: "", dns: "",
                            ping: "", loss: "", tx: "", rx: "" })
   property string actionLabel: ""   // transient "Applying…" style feedback
+  property string importError: ""   // one-line nmcli error, shown with 103
   // Resolved config path as a *reactive* property. QML bindings that call a
   // function (e.g. `resolveConfigPath()`) capture the result at init and never
   // re-evaluate when the inputs change, so a button whose label depends on the
@@ -374,6 +389,15 @@ Panel {
 
   Process {
     id: actionProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: function(text) {
+        // Only the import writes diagnostic text to stdout (the nmcli error
+        // line on a 103); the toggle runs nmcli directly and stays silent.
+        var line = String(text || "").split("\n").pop().trim()
+        if (line !== "") root.importError = line
+      }
+    }
     onExited: function(code) { root.onActionExited(code) }
   }
 
