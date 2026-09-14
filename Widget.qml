@@ -65,6 +65,85 @@ Panel {
   property bool on: false
   property bool connKnown: true
   property bool busy: false
+  // ---- import -----------------------------------------------------------------
+  // Imports the .conf into NetworkManager. Two source cases:
+  //   - user-readable (~/.config/wireguard/<conn>.conf or an explicit
+  //     configFile setting) → imported directly as the user;
+  //   - /etc/wireguard/ (drwx------ root:root — this process cannot even
+  //     stat it) → copied to a private dir via pkexec first, which raises
+  //     Omarchy's themed polkit auth dialog (the same pattern the
+  //     first-party tailscale panel uses for `pkexec tailscale set ...`).
+  //     pkexec only ever runs on an explicit button press.
+  // The .conf is always staged into a 0700 mktemp dir (nmcli requires the
+  // file to be named "<iface>.conf") and that dir is removed on exit via
+  // trap, so the WireGuard private key is never left on disk.
+  // Exit codes: 0 ok · 15 auth cancelled · 102 source not found · 103 import failed.
+  property string _lastAction: "toggle"
+
+  function importConfig() {
+    if (root.busy || root.connKnown) return
+    var src = root.resolveConfigPath()
+    var viaRoot = false
+    // resolveConfigPath() can only see user-readable files (it stats them).
+    // /etc/wireguard/ is 0700 root:root, so anything there is invisible to
+    // this process — fall back to the setting/conventional path and let
+    // pkexec (root, via the themed auth dialog) read it.
+    if (src === "" && root.cfgPath.indexOf("/etc/wireguard/") === 0) {
+      src = root.cfgPath
+      viaRoot = true
+    } else if (src === "") {
+      src = "/etc/wireguard/" + root.connName + ".conf"
+      viaRoot = true
+    } else if (src.indexOf("/etc/wireguard/") === 0) {
+      viaRoot = true
+    }
+    var pk = viaRoot ? "pkexec" : ""
+    root.busy = true
+    root._lastAction = "import"
+    root.actionLabel = viaRoot && src.indexOf("/etc/") === 0 ? "Authorizing…" : "Importing…"
+    // The whole plan runs as one bash invocation. $1=conn name, $2=source
+    // .conf, $3=pkexec-or-empty. Staged into a 0700 mktemp dir (nmcli requires
+    // the file to be named "<iface>.conf") and removed on exit via trap, so the
+    // WireGuard private key never lingers. pkexec exit codes are preserved
+    // (126 = dialog cancelled, 127 = not authorized); any other non-zero copy
+    // = 101 (source missing). nmcli import does NOT reject a name collision —
+    // it silently adds a second connection with the same name — so importing
+    // replaces: any existing profile with the same name (the very one the user
+    // asked to load) is deleted first. No other profile is ever touched.
+    actionProc.command = ["bash", "-lc",
+      "c=\"$1\"; src=\"$2\"; pk=\"$3\"; " +
+      "d=$(mktemp -d) || exit 103; trap 'rm -rf \"$d\"' EXIT; " +
+      "if [ -n \"$pk\" ]; then $pk cp -- \"$src\" \"$d/$c.conf\" 2>/dev/null; rc=$?; " +
+      "else cp -- \"$src\" \"$d/$c.conf\" 2>/dev/null; rc=$?; fi; " +
+      "if [ $rc -ne 0 ]; then case $rc in 126) exit 126;; 127) exit 127;; *) exit 101;; esac; fi; " +
+      "chmod 600 \"$d/$c.conf\"; " +
+      "nmcli -t -f NAME c show 2>/dev/null | grep -qxF \"$c\" && nmcli connection delete \"$c\" 2>/dev/null; " +
+      "nmcli connection import type wireguard file \"$d/$c.conf\" 2>/dev/null || exit 103; " +
+      "exit 0",
+      "--", root.connName, src, pk]
+    actionProc.running = true
+  }
+
+  function onActionExited(code) {
+    var wasImport = (root._lastAction === "import")
+    root.busy = false
+    if (wasImport) {
+      if (code === 0) {
+        root.actionLabel = ""
+        root._lastAction = "toggle"
+      } else {
+        root.actionLabel = code === 126
+          ? "Authorization cancelled"
+          : (code === 127 ? "Authentication failed"
+             : (code === 101 ? "No .conf found in /etc/wireguard"
+                : "Import failed"))
+        actionLabelTimer.restart()
+      }
+    } else {
+      root.actionLabel = ""
+    }
+    Qt.callLater(root.refresh)
+  }
   // { iface, ip, prefix, gateway, peer, endpoint, handshake, dns,
   //    ping, loss, tx, rx } — ping/loss/tx/rx only while the tunnel is up.
   property var details: ({ iface: "", ip: "", prefix: "", gateway: "", peer: "",
@@ -232,23 +311,12 @@ Panel {
     actionProc.running = true
   }
 
-  function importConfig() {
-    var path = root.resolveConfigPath()
-    if (path === "" || root.busy) return
-    root.busy = true
-    root.actionLabel = "Importing…"
-    actionProc.command = ["bash", "-lc",
-      "{ nmcli connection import type wireguard file " + Util.shellQuote(path) +
-      " 2>/dev/null || { nmcli connection delete " + root.connName +
-      " 2>/dev/null; nmcli connection import type wireguard file " + Util.shellQuote(path) + "; }; }"]
-    actionProc.running = true
-  }
-
   // ---- keyboard nav ---------------------------------------------------------------
   function moveFocus(dy) {
-    // Two rows: clamp the index; direction only matters for the first press.
-    if (dy > 0 && root.actionsIndex === 0) root.actionsIndex = 1
-    else if (dy < 0 && root.actionsIndex === 1) root.actionsIndex = 0
+    // The import row only exists while nothing is loaded, so clamp to it.
+    var maxIndex = importBtn.visible ? 1 : 0
+    if (dy > 0 && root.actionsIndex < maxIndex) root.actionsIndex += 1
+    else if (dy < 0 && root.actionsIndex > 0) root.actionsIndex -= 1
   }
 
   function activateCursor() {
@@ -306,11 +374,16 @@ Panel {
 
   Process {
     id: actionProc
-    onExited: function(code) {
-      root.busy = false
-      root.actionLabel = ""
-      Qt.callLater(root.refresh)
-    }
+    onExited: function(code) { root.onActionExited(code) }
+  }
+
+  // Transient action/error label: auto-clears so a failed import doesn't
+  // linger forever next to the live status.
+  Timer {
+    id: actionLabelTimer
+    interval: 4000
+    repeat: false
+    onTriggered: root.actionLabel = ""
   }
 
   // Always-on probe drives the bar icon even while the panel is closed.
@@ -554,27 +627,34 @@ Panel {
         Button {
           id: importBtn
           width: parent.width
+          // Only offered while no connection is loaded: once NM knows about
+          // the tunnel there is nothing to import (re-importing would delete
+          // the live profile). Shown while busy too, so a running import
+          // keeps its slot.
+          visible: !root.connKnown || root.busy
           // `cfgPathResolved` is a reactive property (refreshed in refresh()),
           // not a function call, so this binding re-evaluates when the resolved
           // path changes. A function call in a QML binding captures the value
           // once at init and would leave the label stuck/empty.
-          text: root.busy && root.actionLabel === "Importing…"
+          // Busy label ("Importing…") and transient errors ("No .conf found")
+          // both live in actionLabel; the label timer clears the latter.
+          text: root.actionLabel !== ""
             ? root.actionLabel
             : (root.cfgPathResolved !== ""
                 ? "Import config to NetworkManager"
-                : "Import config — no .conf found")
+                : "Import config from /etc/wireguard/" + root.connName + ".conf")
           tooltipText: root.cfgPathResolved !== ""
-            ? root.cfgPathResolved
-            : "No config found. Set configFile, or place " + root.connName + ".conf in ~/.config/wireguard/ or /etc/wireguard/."
+            ? "Imports " + root.cfgPathResolved
+            : "Copies /etc/wireguard/" + root.connName + ".conf (asks for your password) and imports it into NetworkManager."
           fontSize: Style.font.bodySmall
-          foreground: root.busy ? root.dim : root.dim
+          foreground: root.dim
           fontFamily: root.fontFamily
           horizontalPadding: Style.spacing.controlPaddingX
           verticalPadding: Style.spacing.controlPaddingY
           bordered: true
           active: root.cursorActive && root.actionsIndex === 1
-          opacity: (root.busy || root.cfgPathResolved === "") ? 0.5 : 1
-          onClicked: { if (root.busy || root.cfgPathResolved === "") return; root.importConfig() }
+          opacity: root.busy ? 0.5 : 1
+          onClicked: { if (root.busy) return; root.importConfig() }
           onHovered: function(isHovered) {
             if (!isHovered) return
             root.cursorActive = true
