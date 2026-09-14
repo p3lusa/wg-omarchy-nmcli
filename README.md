@@ -16,12 +16,14 @@ NetworkManager.
   1.5 s while the panel is open)
 - **DNS is read-only on purpose**: the panel shows the DNS servers from your
   WireGuard config (the only leak-free source) but never edits them
-- **Connect / Disconnect** button and **Import config** action (replaces the
-  old right-click import)
-- **Import config** is always visible: it uses your `configFile` setting if
-  set, otherwise falls back to `~/.config/wireguard/<name>.conf` and
-  `/etc/wireguard/<name>.conf`. If none of those exist the button is disabled
-  and says so.
+- **Connect / Disconnect** button and **Import config** action
+- **Import config** is shown only while NetworkManager has no connection for
+  the tunnel yet (once a profile is loaded there is nothing to import). It
+  resolves the source as: your `configFile` setting →
+  `~/.config/wireguard/<name>.conf` → `/etc/wireguard/<name>.conf`. Configs
+  under `/etc/wireguard/` (0700, root-only) are copied through `pkexec`,
+  which raises Omarchy's themed polkit auth dialog — the same pattern the
+  built-in Tailscale panel uses.
 - Full keyboard navigation (↑/↓/←/→, Enter, Esc, `r` to refresh)
 - Theme-aware: every color is derived from the bar theme, so a theme switch
   repaints the panel live
@@ -61,22 +63,41 @@ unknown.
 |---|---|
 | Left-click (icon) | Open / close the panel |
 | **Connect / Disconnect** | `nmcli connection up wg0` / `nmcli connection down wg0` |
-| **Import config** | `nmcli connection import type wireguard file <path>` (auto-fallback: delete + re-import if the connection already exists) |
+| **Import config** | Stage the `.conf` into a private temp file, delete any existing profile with the same name, then `nmcli connection import type wireguard file …` (via `pkexec` for `/etc/wireguard/` sources) |
 
 ### Importing your wg0.conf
 
-1. (Optional) Set `configFile` — e.g. `~/.config/wireguard/wg0.conf`.
-   Without it the widget probes `~/.config/wireguard/<name>.conf` then
-   `/etc/wireguard/<name>.conf`.
-2. Open the panel and click **Import config**. NetworkManager imports the
-   connection and names it after the `[Interface]` section (usually `wg0`),
-   matching the default `connectionName`.
-3. Click **Connect tunnel**.
+The **Import config** button is only visible while no `wg0` profile is loaded
+in NetworkManager.
 
-> If the import fails with "connection already exists", the widget retries by
-> deleting the stale connection and re-importing. Manual equivalent:
-> `nmcli connection delete wg0 && nmcli connection import type wireguard
-> file ~/.config/wireguard/wg0.conf`.
+1. (Optional) Set `configFile` — e.g. `~/.config/wireguard/wg0.conf`.
+   Without it the widget probes `~/.config/wireguard/<name>.conf` (readable as
+   your user) and, failing that, `/etc/wireguard/<name>.conf`.
+2. Open the panel and click **Import config**. For `/etc/wireguard/` sources
+   Omarchy's themed polkit dialog asks for your password (the config lives in
+   a 0700 root-only directory the widget cannot read directly).
+3. The import **replaces** an existing profile of the same name: `nmcli` does
+   *not* reject duplicate connection names — it would silently add a second
+   `wg0` — so any profile with that exact name is deleted before importing.
+   No other profile is ever touched.
+4. Click **Connect tunnel** (or let it auto-connect — imported profiles
+   default to `autoconnect=yes`).
+
+The private key is staged into a `0700` `mktemp` directory and removed on
+exit (`trap`), so it never lingers on disk. If the import fails, the first
+line of the `nmcli` error is shown on the button (e.g. a malformed config),
+along with these transient labels: *Authorizing…* / *Importing…* while
+running, and *Authorization cancelled* / *Authentication failed* / *No .conf
+found in /etc/wireguard* / *Import failed: …* on error.
+
+Manual equivalent (from a terminal):
+
+```sh
+# user-readable config:
+nmcli connection import type wireguard file ~/.config/wireguard/wg0.conf
+# /etc/wireguard config (needs root; nmcli requires the file to be named <iface>.conf):
+sudo cp /etc/wireguard/wg0.conf /tmp/wg0.conf && nmcli connection import type wireguard file /tmp/wg0.conf && rm /tmp/wg0.conf
+```
 
 ### Where the live numbers come from
 
@@ -158,9 +179,18 @@ metrics card.
 Omarchy compiles each bar-widget entry point **once** and caches the
 `Component` keyed by its file URL. An in-place `omarchy plugin update <id>`
 that keeps the same entry-point filename (`Widget.qml`) will **not**
-recompile the QML on rescan — the old compiled component keeps serving.
+recompile the QML on rescan — the old compiled component keeps serving
+(Quickshell also caches compiled QML under
+`~/.cache/quickshell/qmlcache/`). A rescan can report success while the
+running shell still executes the *previous* code.
 
-**After updating this plugin, always run `omarchy restart shell`.**
+**After updating this plugin, always run `omarchy restart shell`.** If you
+ever see symptoms of stale QML (old errors in the log, new UI missing):
+
+```sh
+rm -rf ~/.cache/quickshell/qmlcache/*
+omarchy restart shell
+```
 
 Verify the new code is live:
 
@@ -184,8 +214,19 @@ nmcli connection delete wg0
 ## Troubleshooting
 
 - **Icon dimmed, panel says "No connection found"** — NetworkManager has no
-  connection named `connectionName`. Set `configFile` and use **Import
-  config**, or fix `connectionName`.
+  connection named `connectionName`. That is also when the **Import config**
+  button appears: set `configFile` (if your config is elsewhere) and use
+  **Import config**, or fix `connectionName`.
+- **Import config says "Authorization cancelled"** — you dismissed the polkit
+  dialog. Click the button and complete the dialog.
+- **Import config says "Authentication failed"** — the password entered in
+  the polkit dialog was rejected (the `pkexec` policy requires admin).
+- **Import config says "No .conf found in /etc/wireguard"** — no
+  `/etc/wireguard/<name>.conf` exists and no user-readable config was found;
+  set `configFile`.
+- **Import config says "Import failed: …"** — `nmcli` rejected the config
+  (malformed, wrong file name, …); the first error line is shown on the
+  button.
 - **Toggle fails** — the connection exists but `up` failed; run
   `nmcli connection up wg0` in a terminal for the error.
 - **Gateway / ping / loss empty while connected** — the widget reads the
