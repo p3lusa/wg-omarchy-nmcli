@@ -39,7 +39,7 @@ Panel {
     for (var i = 0; i < root.cfgCandidates.length; i++) {
       var p = String(root.cfgCandidates[i] || "").trim()
       if (p === "") continue
-      if (p.indexOf("~/") === 0) p = Qt.application.homePath() + p.slice(1)
+      if (p.indexOf("~/") === 0) p = (Quickshell.env("HOME") || "") + p.slice(1)
       if (root.fileExists(p)) return p
     }
     return ""
