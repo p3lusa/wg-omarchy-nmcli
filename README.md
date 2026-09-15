@@ -53,6 +53,24 @@ omarchy plugin add https://github.com/p3lusa/wg-omarchy-nmcli.git --enable --yes
   Without it the **Last handshake** cell stays empty; everything else still
   works.
 
+**Automatic dependency check.** On every status poll the widget probes, as the
+user (no privilege escalation), whether it can actually run WireGuard:
+
+- **NetworkManager running** and **kernel module** (loaded, or loadable via a
+  dry-run `modprobe -n`) — both are required. If either is missing the panel
+  shows a red banner with the reason and, where the distro has a single
+  canonical package, the install command (e.g. `sudo apt install wireguard`).
+  The **Connect tunnel** button is dimmed and refuses to act, so you are never
+  left with a silent `nmcli` failure.
+- **`wg` from wireguard-tools** — optional. Only while the tunnel is up does a
+  missing `wg` matter, and it only degrades the *Last handshake* cell, so the
+  panel shows a quiet note (with `sudo pacman -S wireguard-tools` /
+  `sudo apt install wireguard-tools` etc.) instead of a hard error.
+
+The probe runs on every poll and re-checks automatically: install the missing
+package and the banner clears on the next poll (a few seconds) without a
+restart.
+
 ## Usage
 
 The widget polls NetworkManager for a wireguard connection named `wg0`

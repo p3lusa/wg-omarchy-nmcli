@@ -65,6 +65,33 @@ Panel {
   property bool on: false
   property bool connKnown: true
   property bool busy: false
+  // ---- dependency check --------------------------------------------------
+  // checkDeps() probes what the system actually has to run WireGuard:
+  // a running NetworkManager and the kernel module (fatal — without them the
+  // tunnel cannot come up) plus the optional `wg` binary from
+  // wireguard-tools (degrades only the "Last handshake" cell). The script
+  // also reports an install command for the detected package manager.
+  property bool nmMissing: false
+  property bool moduleMissing: false
+  property bool wgMissing: false
+  property string hintModule: ""
+  property string hintTools: ""
+  readonly property bool depsFatal: nmMissing || moduleMissing
+  // One-line banner text; empty when everything the panel needs is present.
+  // The wireguard-tools hint only shows while the tunnel is up, since that is
+  // when the missing `wg` is actually felt (empty handshake cell).
+  readonly property string depsMessage: {
+    var msgs = []
+    if (root.nmMissing)
+      msgs.push("NetworkManager is not running — the tunnel cannot be managed")
+    if (root.moduleMissing)
+      msgs.push("WireGuard kernel module not available — the tunnel cannot come up" +
+                (root.hintModule !== "" ? ". Install: " + root.hintModule : ""))
+    if (root.wgMissing && root.on)
+      msgs.push("wireguard-tools not installed — 'Last handshake' will stay empty" +
+                (root.hintTools !== "" ? ". Install: " + root.hintTools : ""))
+    return msgs.join("  ·  ")
+  }
   // ---- import -----------------------------------------------------------------
   // Imports the .conf into NetworkManager. Two source cases:
   //   - user-readable (~/.config/wireguard/<conn>.conf or an explicit
@@ -206,6 +233,7 @@ Panel {
     refreshCfgPath()
     probeStatus()
     refreshDetails()
+    checkDeps()
   }
 
   function probeStatus() {
@@ -223,6 +251,64 @@ Panel {
     if (detailsProc.running) return
     detailsProc.command = ["bash", "-lc", root.detailsScript(), "x", root.connName]
     detailsProc.running = true
+  }
+
+  // ---- dependency check -------------------------------------------------------
+  // Probes, as the user (no privilege escalation), what the system has to run
+  // WireGuard: a running NetworkManager, the kernel module (loaded or loadable
+  // via `modprobe -n` — a dry run, nothing is loaded), and the `wg` binary from
+  // wireguard-tools. Emits tab-separated key/value lines (same shape as the
+  // details probe) plus best-effort install commands for the detected package
+  // manager. Runs cheaply on every poll and degrades to "no hint" where a
+  // distro has no single canonical package (e.g. Arch ships the module with the
+  // kernel, so a missing module there gets no install hint).
+  function checkDeps() {
+    if (depProc.running) return
+    depProc.command = ["bash", "-lc",
+      "nm=0; pgrep -x NetworkManager >/dev/null 2>&1 || nm=1; " +
+      "module=0; " +
+      "if [ ! -e /sys/module/wireguard ]; then " +
+      "  if command -v modprobe >/dev/null 2>&1; then " +
+      "    modprobe -n --ignore-install wireguard >/dev/null 2>&1 || module=1; " +
+      "  else module=1; fi; fi; " +
+      "wg=0; command -v wg >/dev/null 2>&1 || wg=1; " +
+      "hintmod=\"\"; hinttools=\"\"; " +
+      "pm=\"\"; " +
+      "if command -v pacman >/dev/null 2>&1; then pm=pacman; " +
+      "elif command -v apt-get >/dev/null 2>&1; then pm=apt; " +
+      "elif command -v dnf >/dev/null 2>&1; then pm=dnf; " +
+      "elif command -v zypper >/dev/null 2>&1; then pm=zypper; fi; " +
+      "if [ $module -eq 1 ]; then " +
+      "  case $pm in apt) hintmod='sudo apt install wireguard';; " +
+      "  dnf) hintmod='sudo dnf install wireguard';; " +
+      "  zypper) hintmod='sudo zypper install wireguard';; esac; fi; " +
+      "if [ $wg -eq 1 ]; then " +
+      "  case $pm in pacman) hinttools='sudo pacman -S wireguard-tools';; " +
+      "  apt) hinttools='sudo apt install wireguard-tools';; " +
+      "  dnf) hinttools='sudo dnf install wireguard-tools';; " +
+      "  zypper) hinttools='sudo zypper install wireguard-tools';; esac; fi; " +
+      "printf 'nm\\t%s\\n' \"$nm\"; " +
+      "printf 'module\\t%s\\n' \"$module\"; " +
+      "printf 'wg\\t%s\\n' \"$wg\"; " +
+      "printf 'hintModule\\t%s\\n' \"$hintmod\"; " +
+      "printf 'hintTools\\t%s\\n' \"$hinttools\""
+    ]
+    depProc.running = true
+  }
+
+  function updateDeps(text) {
+    var lines = String(text || "").split("\n")
+    var got = {}
+    for (var i = 0; i < lines.length; i++) {
+      var tab = lines[i].indexOf("\t")
+      if (tab < 0) continue
+      got[lines[i].slice(0, tab)] = lines[i].slice(tab + 1).trim()
+    }
+    if ("nm" in got) root.nmMissing = (got.nm === "1")
+    if ("module" in got) root.moduleMissing = (got.module === "1")
+    if ("wg" in got) root.wgMissing = (got.wg === "1")
+    root.hintModule = got.hintModule || ""
+    root.hintTools = got.hintTools || ""
   }
 
   function detailsScript() {
@@ -320,6 +406,9 @@ Panel {
   // ---- actions ----------------------------------------------------------------
   function toggleTunnel() {
     if (root.busy || !root.connKnown) return
+    // Refuse to connect while a fatal dependency is missing — the banner in
+    // the panel explains why; a bare nmcli failure would just look like a bug.
+    if (root.depsFatal && !root.on) return
     root.busy = true
     root.actionLabel = root.on ? "Disconnecting…" : "Connecting…"
     actionProc.command = ["nmcli", "connection", root.on ? "down" : "up", root.connName]
@@ -361,6 +450,7 @@ Panel {
     function setStatus(target: string): void {
       var up = target === "up" || target === "on" || target === "true"
       if (up === root.on) return
+      if (root.depsFatal && up) return
       root.busy = true
       root.actionLabel = up ? "Connecting…" : "Disconnecting…"
       actionProc.command = ["nmcli", "connection", up ? "up" : "down", root.connName]
@@ -384,6 +474,17 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.updateDetails(text)
+    }
+  }
+
+  // Dependency probe (see checkDeps()). Runs as the user, never blocks the
+  // UI, and repopulates the nmMissing / moduleMissing / wgMissing flags that
+  // the panel banner and the connect guard read.
+  Process {
+    id: depProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.updateDeps(text)
     }
   }
 
@@ -614,6 +715,47 @@ Panel {
         }
       }
 
+      // ---- Dependency banner ----------------------------------------------
+      // Shown only when a required piece is missing. Fatal gaps (no
+      // NetworkManager / kernel module) tint the banner urgent; the optional
+      // wireguard-tools gap stays a quiet dim note. Hidden entirely when the
+      // probe has not run yet (depsMessage is empty), so a clean system never
+      // shows extra chrome.
+      Item {
+        id: depBanner
+        width: parent.width
+        visible: root.depsMessage !== ""
+        implicitHeight: visible ? depBannerText.implicitHeight + Style.spacing.md * 2 : 0
+
+        Rectangle {
+          anchors.fill: parent
+          anchors.leftMargin: Style.space(2)
+          anchors.rightMargin: Style.space(2)
+          radius: Style.cornerRadius
+          color: root.depsFatal ? root.urgent : root.dim
+          opacity: 0.12
+        }
+
+        Text {
+          id: depBannerText
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          anchors.leftMargin: Style.spacing.md
+          anchors.rightMargin: Style.spacing.md
+          anchors.topMargin: Style.spacing.sm
+          anchors.bottomMargin: Style.spacing.sm
+          textFormat: Text.PlainText
+          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+          text: root.depsMessage
+          color: root.depsFatal ? root.urgent : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          verticalAlignment: Text.AlignVCenter
+        }
+      }
+
       // ---- Actions ----
       PanelSeparator {
         foreground: root.foreground
@@ -636,7 +778,7 @@ Panel {
           verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
           bordered: true
           active: root.cursorActive && root.actionsIndex === 0
-          opacity: (root.busy || !root.connKnown) ? 0.5 : 1
+          opacity: (root.busy || !root.connKnown || (root.depsFatal && !root.on)) ? 0.5 : 1
           onClicked: {
             if (root.busy || !root.connKnown) return
             root.toggleTunnel()
