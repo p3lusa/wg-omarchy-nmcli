@@ -250,6 +250,15 @@ node tests/validname.test.js
 # -> RESULT ok=15 bad=0
 ```
 
+`Widget.qml` is also validated with the real Qt 6 parser (`qmllint`), which
+reports **zero errors**; the only diagnostics are warnings for the Omarchy
+bar-runtime symbols (`qs.Commons`, `qs.Ui`, `bar`, `Style`, …) that are not
+present outside the bar, so they are expected in a bare linter environment:
+
+```sh
+/usr/lib/qt6/bin/qmllint Widget.qml   # exit 0, no Error lines
+```
+
 ## Update lifecycle (important)
 
 Omarchy compiles each bar-widget entry point **once** and caches the
