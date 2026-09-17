@@ -50,6 +50,23 @@ Panel {
     return Qt.fileExists(path)
   }
 
+  // Strict allowlist for the NM connection name. It is used both as a
+  // pathname component (the staged "<name>.conf") and as a literal inside
+  // shell commands (nmcli, grep -qxF), so only [A-Za-z0-9._-] is accepted.
+  // Rejects empty, over-long, path separators, backslash, traversal (..),
+  // a leading dot (hidden/relative), NUL, and any shell metacharacter.
+  // Returns the validated name, or "" when the name must be refused.
+  function validConnName() {
+    var n = String(root.connName || "").trim()
+    if (n.length === 0 || n.length > 128) return ""
+    if (n.indexOf("/") >= 0) return ""
+    if (n.indexOf("\\") >= 0) return ""
+    if (n.indexOf("..") >= 0) return ""
+    if (n.charAt(0) === ".") return ""
+    if (!/^[A-Za-z0-9._-]+$/.test(n)) return ""
+    return n
+  }
+
   // ---- theme --------------------------------------------------------------
   // Every color derives from the bar / theme (same sources the first-party
   // network panel binds), so a theme switch repaints this panel live. The hex
@@ -104,35 +121,57 @@ Panel {
   // The .conf is always staged into a 0700 mktemp dir (nmcli requires the
   // file to be named "<iface>.conf") and that dir is removed on exit via
   // trap, so the WireGuard private key is never left on disk.
-  // Exit codes: 0 ok · 15 auth cancelled · 102 source not found · 103 import failed.
+  // Exit codes: 0 ok · 126 auth cancelled · 127 not authorized · 101 source
+  // missing/rejected · 103 import failed · 104 invalid connection name.
   property string _lastAction: "toggle"
 
   function importConfig() {
     if (root.busy || root.connKnown) return
     var src = root.resolveConfigPath()
     var viaRoot = false
-    // resolveConfigPath() can only see user-readable files (it stats them).
-    // /etc/wireguard/ is 0700 root:root, so anything there is invisible to
-    // this process — fall back to the setting/conventional path and let
-    // pkexec (root, via the themed auth dialog) read it.
-    if (src === "" && root.cfgPath.indexOf("/etc/wireguard/") === 0) {
-      src = root.cfgPath
-      viaRoot = true
-    } else if (src === "") {
-      src = "/etc/wireguard/" + root.connName + ".conf"
-      viaRoot = true
-    } else if (src.indexOf("/etc/wireguard/") === 0) {
+    // The connection name is used as a pathname component (the staged
+    // "<name>.conf") and inside shell commands (nmcli, grep), so it must pass
+    // the strict allowlist before anything runs. An invalid name aborts with a
+    // transient label and never reaches a process — let alone a privileged one.
+    var c = root.validConnName()
+    if (c === "") {
+      root.importError = ""
+      root._lastAction = "import"
+      root.actionLabel = "Invalid connection name"
+      actionLabelTimer.restart()
+      return
+    }
+    // A user-readable config (the configFile setting or
+    // ~/.config/wireguard/<name>.conf) is imported directly as the user — no
+    // privilege escalation. The privileged source is ALWAYS
+    // /etc/wireguard/<name>.conf, built from the validated name: it is
+    // canonical and bounded by construction, so it cannot traverse (../) or
+    // alias (symlink) out of the 0700 root-only directory. The configFile
+    // setting is deliberately NEVER treated as a privileged path — only the
+    // conventional per-connection file under /etc/wireguard/ is read via
+    // pkexec. resolveConfigPath() only sees user-readable files (it stats
+    // them); /etc/wireguard/ is 0700 root:root, so anything there is invisible
+    // to this process and falls through to the conventional privileged path.
+    if (src === "") {
+      src = "/etc/wireguard/" + c + ".conf"
       viaRoot = true
     }
     var pk = viaRoot ? "pkexec" : ""
     root.busy = true
     root._lastAction = "import"
     root.importError = ""
-    root.actionLabel = viaRoot && src.indexOf("/etc/") === 0 ? "Authorizing…" : "Importing…"
-    // The whole plan runs as one bash invocation. $1=conn name, $2=source
-    // .conf, $3=pkexec-or-empty. Staged into a 0700 mktemp dir (nmcli requires
-    // the file to be named "<iface>.conf") and removed on exit via trap, so the
-    // WireGuard private key never lingers.
+    root.actionLabel = viaRoot ? "Authorizing…" : "Importing…"
+    // The whole plan runs as one bash invocation. $1=conn name (validated),
+    // $2=source .conf, $3=pkexec-or-empty. Staged into a 0700 mktemp dir (nmcli
+    // requires the file to be named "<iface>.conf") and removed on exit via
+    // trap, so the WireGuard private key never lingers.
+    //
+    // Defence in depth in the shell: the name is re-validated against the same
+    // allowlist (exit 104 on failure), and in the privileged branch the source
+    // must be EXACTLY /etc/wireguard/<name>.conf — a canonical, bounded,
+    // no-follow path whose parent is the intended 0700 root-only directory.
+    // Any traversal, extra path segment, or symlink alias is refused (exit
+    // 101) before pkexec cat is invoked.
     //
     // The copy is `cat > staged`, NOT `cp`: a pkexec'd cp would create the
     // staged file as root:root (mode inherited from the 0600 source), and the
@@ -140,17 +179,22 @@ Panel {
     // redirection is performed by this user's shell, so the file belongs to
     // the user and nmcli can read it.
     //
-    // pkexec exit codes are preserved (126 = dialog cancelled, 127 = not
-    // authorized); any other non-zero copy = 101 (source missing). nmcli
-    // import does NOT reject a name collision — it silently adds a second
-    // connection with the same name — so importing replaces: any existing
-    // profile with the same name (the very one the user asked to load) is
-    // deleted first. No other profile is ever touched. On import failure the
-    // nmcli error is echoed to stdout (the script's only stdout) for display.
+    // Exit codes: 0 ok · 126 auth cancelled · 127 not authorized · 101 source
+    // missing/rejected · 103 import failed · 104 invalid name. nmcli import
+    // does NOT reject a name collision — it silently adds a second connection
+    // with the same name — so importing replaces: any existing profile with the
+    // same name (the very one the user asked to load) is deleted first. No
+    // other profile is ever touched. On import failure the nmcli error is
+    // echoed to stdout (the script's only stdout) for display.
     actionProc.command = ["bash", "-lc",
       "c=\"$1\"; src=\"$2\"; pk=\"$3\"; " +
+      "case \"$c\" in ''|.*) exit 104;; esac; " +
+      "case \"$c\" in *[!A-Za-z0-9._-]*|*..*) exit 104;; esac; " +
       "d=$(mktemp -d) || exit 103; trap 'rm -rf \"$d\"' EXIT; " +
-      "if [ -n \"$pk\" ]; then $pk cat -- \"$src\" > \"$d/$c.conf\" 2>/dev/null; rc=$?; " +
+      "if [ -n \"$pk\" ]; then " +
+      "  [ \"$src\" = \"/etc/wireguard/$c.conf\" ] || exit 101; " +
+      "  [ -L \"$src\" ] && exit 101; " +
+      "  $pk cat -- \"$src\" > \"$d/$c.conf\" 2>/dev/null; rc=$?; " +
       "else cat -- \"$src\" > \"$d/$c.conf\" 2>/dev/null; rc=$?; fi; " +
       "if [ $rc -ne 0 ]; then case $rc in 126) exit 126;; 127) exit 127;; *) exit 101;; esac; fi; " +
       "chmod 600 \"$d/$c.conf\"; " +
@@ -158,7 +202,7 @@ Panel {
       "err=$(nmcli connection import type wireguard file \"$d/$c.conf\" 2>&1); rc=$?; " +
       "if [ $rc -ne 0 ]; then printf '%s\\n' \"$err\" | head -n 1; exit 103; fi; " +
       "exit 0",
-      "--", root.connName, src, pk]
+      "--", c, src, pk]
     actionProc.running = true
   }
 
@@ -173,10 +217,11 @@ Panel {
         var msg = code === 126
           ? "Authorization cancelled"
           : (code === 127 ? "Authentication failed"
-             : (code === 101 ? "No .conf found in /etc/wireguard"
-                : (code === 103 && root.importError !== ""
-                    ? "Import failed: " + root.importError
-                    : "Import failed")))
+             : (code === 104 ? "Invalid connection name"
+                : (code === 101 ? "No .conf found in /etc/wireguard"
+                   : (code === 103 && root.importError !== ""
+                       ? "Import failed: " + root.importError
+                       : "Import failed"))))
         root.actionLabel = msg
         actionLabelTimer.restart()
       }

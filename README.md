@@ -23,7 +23,9 @@ NetworkManager.
   `~/.config/wireguard/<name>.conf` → `/etc/wireguard/<name>.conf`. Configs
   under `/etc/wireguard/` (0700, root-only) are copied through `pkexec`,
   which raises Omarchy's themed polkit auth dialog — the same pattern the
-  built-in Tailscale panel uses.
+  built-in Tailscale panel uses. The connection name and the privileged
+  source path are strictly validated before any privileged read (see
+  [Security](#security)).
 - Full keyboard navigation (↑/↓/←/→, Enter, Esc, `r` to refresh)
 - Theme-aware: every color is derived from the bar theme, so a theme switch
   repaints the panel live
@@ -191,6 +193,62 @@ and return types because Quickshell only registers typed functions. The
 always-on probe drives the bar icon even while the panel is closed; a faster
 1.5 s poll runs while the panel is open and the tunnel is up to feed the
 metrics card.
+
+## Security
+
+The **Import config** action reads a file that may live in a root-only
+directory (`/etc/wireguard/`, mode `0700`) and runs a privileged copy through
+`pkexec`. Because that crosses a privilege boundary, the plugin applies the
+following controls so that only the intended WireGuard config can ever be
+read as root. These close the two findings reported against the import path
+(any `/etc/wireguard/`-prefixed string treated as privileged without
+canonicalisation, and the connection name used as a pathname component
+without validation).
+
+1. **Connection name allowlist.** `connectionName` is accepted only when it
+   matches `^[A-Za-z0-9._-]+$` and is non-empty, ≤ 128 chars, and contains no
+   path separator, backslash, `..`, or leading dot. The name is used both as
+   the staged `<name>.conf` filename and as a literal inside `nmcli`/`grep`,
+   so it is validated in QML *and* re-validated in the shell before anything
+   runs. Anything else aborts with *Invalid connection name* and never reaches
+   a process — let alone a privileged one.
+2. **Privileged source built from the validated name, not taken as input.**
+   The only source read via `pkexec` is the conventional
+   `/etc/wireguard/<name>.conf`, constructed from the validated name. It is
+   therefore canonical and bounded by construction: it cannot contain `../`
+   or alias (symlink) out of the `0700` directory. The `configFile` setting is
+   **never** treated as a privileged path — it is imported directly as the
+   user, which is exactly what it is (a user-readable file).
+3. **No-follow guard in the shell.** Before the privileged `cat`, the script
+   requires `$src` to be *exactly* `/etc/wireguard/<name>.conf` and refuses a
+   symlink at that path. Any traversal, extra segment, or alias is rejected
+   (exit 101) before the privileged read is invoked.
+
+The staged copy uses `cat > staged` (a `pkexec`-ed `cp` would leave the staged
+file root-owned); the staging dir is a `0700` `mktemp` removed on exit via
+`trap`, so the WireGuard private key never lingers.
+
+Exit codes: `0` ok · `126` auth cancelled · `127` not authorized · `101`
+source missing/rejected · `103` import failed · `104` invalid connection name.
+
+**Automated security baseline.** `tests/security.sh` extracts the *exact* bash
+command shipped in `Widget.qml` and runs it against an isolated mock
+environment (no real privilege escalation, no real `/etc`), asserting that
+valid inputs succeed and that traversal, symlink-alias, and shell-metacharacter
+inputs are refused. It is reproducible and self-contained:
+
+```sh
+bash tests/security.sh
+# -> SECURITY_BASELINE: PASS (13/13)
+```
+
+The same allowlist is unit-tested for the QML layer in
+`tests/validname.test.js`:
+
+```sh
+node tests/validname.test.js
+# -> RESULT ok=15 bad=0
+```
 
 ## Update lifecycle (important)
 

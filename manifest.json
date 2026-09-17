@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.p3lu.wg-omarchy-nmcli",
   "name": "WireGuard VPN",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": "P3lu",
   "license": "MIT",
   "description": "WireGuard VPN widget for the Omarchy bar: left-click opens a themed status panel with live IP/gateway/peer/last-handshake/ping/loss/throughput details, connect/disconnect via nmcli, and one-click import of your .conf into NetworkManager. DNS is read-only (the config's own DNS, to avoid leaks).",
